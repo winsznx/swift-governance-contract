@@ -2,7 +2,18 @@ const hre = require("hardhat");
 const fs = require('fs');
 
 async function main() {
-  console.log("🚀 Deploying Governance Contract to Base Sepolia...\n");
+  // Get network name
+  const network = hre.network.name;
+  const isMainnet = network === "base";
+
+  console.log(`🚀 Deploying Governance Contract to ${network}...\n`);
+
+  // Validate governance token address
+  const governanceToken = process.env.GOVERNANCE_TOKEN_ADDRESS;
+  if (!governanceToken || !governanceToken.startsWith('0x') || governanceToken.length !== 42) {
+    throw new Error("GOVERNANCE_TOKEN_ADDRESS environment variable is required and must be a valid address");
+  }
+  console.log("🪙 Governance Token:", governanceToken);
 
   const [deployer] = await hre.ethers.getSigners();
   console.log("📝 Deploying with account:", deployer.address);
@@ -13,7 +24,7 @@ async function main() {
   const Contract = await hre.ethers.getContractFactory("Governance");
 
   console.log("⏳ Deploying Governance contract...");
-  const contract = await Contract.deploy();
+  const contract = await Contract.deploy(governanceToken);
 
   await contract.waitForDeployment();
   const contractAddress = await contract.getAddress();
@@ -27,11 +38,12 @@ async function main() {
   const receipt = await deployTx.wait();
 
   const deploymentInfo = {
-    network: "base-sepolia",
+    network: network,
     contractName: "Governance",
     contractAddress: contractAddress,
+    governanceToken: governanceToken,
     deployer: deployer.address,
-    chainId: 84532,
+    chainId: isMainnet ? 8453 : 84532,
     timestamp: new Date().toISOString(),
     blockNumber: receipt.blockNumber,
     transactionHash: receipt.hash,
@@ -46,6 +58,7 @@ async function main() {
   console.log("🎉 DEPLOYMENT SUCCESSFUL!");
   console.log("═══════════════════════════════════════");
   console.log("Contract:", contractAddress);
+  console.log("Token:", governanceToken);
   console.log("Gas Used:", receipt.gasUsed.toString());
   console.log("═══════════════════════════════════════\n");
 

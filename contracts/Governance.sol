@@ -2,6 +2,7 @@
 pragma solidity ^0.8.19;
 
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -10,9 +11,15 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
  * @title Governance
  * @dev A DAO governance contract for Swift v2 platform
  * @author Swift v2 Team
+ * @notice Enhanced with security features, gas optimizations, and input validation
  */
-contract Governance is ReentrancyGuard, Ownable {
+contract Governance is ReentrancyGuard, Pausable, Ownable {
     using Counters for Counters.Counter;
+
+    // Constants - Input validation limits
+    uint256 public constant MAX_TITLE_LENGTH = 100;
+    uint256 public constant MAX_DESCRIPTION_LENGTH = 5000;
+    uint256 public constant MAX_ACTIONS_PER_PROPOSAL = 10;
 
     // Events
     event ProposalCreated(
@@ -27,7 +34,7 @@ contract Governance is ReentrancyGuard, Ownable {
     event VoteCast(
         uint256 indexed proposalId,
         address indexed voter,
-        uint8 support,
+        uint8 indexed support,
         uint256 weight,
         string reason
     );
@@ -39,13 +46,30 @@ contract Governance is ReentrancyGuard, Ownable {
 
     event ProposalCancelled(
         uint256 indexed proposalId,
-        address indexed proposer
+        address indexed canceller,
+        bool byAdmin
     );
 
     event DelegateChanged(
         address indexed delegator,
         address indexed fromDelegate,
         address indexed toDelegate
+    );
+
+    event VotingPowerUpdated(
+        address indexed user,
+        uint256 oldPower,
+        uint256 newPower
+    );
+
+    event WhitelistUpdated(
+        address indexed account,
+        bool status
+    );
+
+    event ETHWithdrawn(
+        address indexed recipient,
+        uint256 amount
     );
 
     // Structs
@@ -87,7 +111,7 @@ contract Governance is ReentrancyGuard, Ownable {
     mapping(address => uint256) public votingPower;
     mapping(address => bool) public isWhitelisted;
     
-    IERC20 public governanceToken;
+    IERC20 public immutable governanceToken;
     
     uint256 public constant VOTING_DELAY = 1 days;
     uint256 public constant VOTING_PERIOD = 3 days;
@@ -128,28 +152,40 @@ contract Governance is ReentrancyGuard, Ownable {
     constructor(address _governanceToken) {
         require(_governanceToken != address(0), "Invalid governance token address");
         governanceToken = IERC20(_governanceToken);
-        _proposalIdCounter.increment();
+        
+        unchecked {
+            _proposalIdCounter.increment();
+        }
+        
         isWhitelisted[msg.sender] = true;
+        emit WhitelistUpdated(msg.sender, true);
     }
 
     /**
      * @dev Create a new proposal
-     * @param _title Title of the proposal
-     * @param _description Description of the proposal
-     * @param _actions Array of actions to execute if proposal passes
+     * @param _title Title of the proposal (max 100 chars)
+     * @param _description Description of the proposal (max 5000 chars)
+     * @param _actions Array of actions to execute if proposal passes (max 10)
      */
     function createProposal(
         string memory _title,
         string memory _description,
         ProposalAction[] memory _actions
-    ) external onlyWhitelisted returns (uint256 proposalId) {
+    ) external onlyWhitelisted whenNotPaused returns (uint256 proposalId) {
         require(votingPower[msg.sender] >= PROPOSAL_THRESHOLD, "Insufficient voting power");
-        require(bytes(_title).length > 0, "Title required");
-        require(bytes(_description).length > 0, "Description required");
-        require(_actions.length > 0, "Actions required");
+        
+        // Input validation
+        uint256 titleLength = bytes(_title).length;
+        uint256 descLength = bytes(_description).length;
+        require(titleLength > 0 && titleLength <= MAX_TITLE_LENGTH, "Invalid title length");
+        require(descLength > 0 && descLength <= MAX_DESCRIPTION_LENGTH, "Invalid description length");
+        require(_actions.length > 0 && _actions.length <= MAX_ACTIONS_PER_PROPOSAL, "Invalid actions count");
 
         proposalId = _proposalIdCounter.current();
-        _proposalIdCounter.increment();
+        
+        unchecked {
+            _proposalIdCounter.increment();
+        }
 
         Proposal storage proposal = proposals[proposalId];
         proposal.id = proposalId;
@@ -162,8 +198,10 @@ contract Governance is ReentrancyGuard, Ownable {
         proposal.cancelled = false;
 
         // Add actions
-        for (uint256 i = 0; i < _actions.length; i++) {
+        uint256 actionsLength = _actions.length;
+        for (uint256 i = 0; i < actionsLength;) {
             proposalActions[proposalId].push(_actions[i]);
+            unchecked { ++i; }
         }
 
         emit ProposalCreated(proposalId, msg.sender, _title, _description, proposal.startTime, proposal.endTime);
@@ -179,7 +217,7 @@ contract Governance is ReentrancyGuard, Ownable {
         uint256 _proposalId,
         uint8 _support,
         string memory _reason
-    ) external proposalExists(_proposalId) proposalActive(_proposalId) {
+    ) external proposalExists(_proposalId) proposalActive(_proposalId) whenNotPaused {
         require(_support <= 2, "Invalid support value");
         
         Proposal storage proposal = proposals[_proposalId];
@@ -195,7 +233,7 @@ contract Governance is ReentrancyGuard, Ownable {
             proposal.againstVotes += weight;
         } else if (_support == 1) {
             proposal.forVotes += weight;
-        } else if (_support == 2) {
+        } else {
             proposal.abstainVotes += weight;
         }
 
@@ -210,13 +248,16 @@ contract Governance is ReentrancyGuard, Ownable {
         external 
         proposalExists(_proposalId) 
         proposalExecutable(_proposalId) 
-        nonReentrant 
+        nonReentrant
+        whenNotPaused
     {
         Proposal storage proposal = proposals[_proposalId];
         proposal.executed = true;
 
         ProposalAction[] storage actions = proposalActions[_proposalId];
-        for (uint256 i = 0; i < actions.length; i++) {
+        uint256 actionsLength = actions.length;
+        
+        for (uint256 i = 0; i < actionsLength;) {
             ProposalAction storage action = actions[i];
 
             bytes memory callData;
@@ -228,13 +269,15 @@ contract Governance is ReentrancyGuard, Ownable {
 
             (bool success, ) = action.target.call{value: action.value}(callData);
             require(success, "Action execution failed");
+            
+            unchecked { ++i; }
         }
 
         emit ProposalExecuted(_proposalId, msg.sender);
     }
 
     /**
-     * @dev Cancel a proposal (only proposer can cancel)
+     * @dev Cancel a proposal (proposer or admin can cancel)
      * @param _proposalId ID of the proposal to cancel
      */
     function cancelProposal(uint256 _proposalId) 
@@ -242,19 +285,21 @@ contract Governance is ReentrancyGuard, Ownable {
         proposalExists(_proposalId) 
     {
         Proposal storage proposal = proposals[_proposalId];
-        require(proposal.proposer == msg.sender, "Only proposer can cancel");
+        bool isAdmin = msg.sender == owner();
+        
+        require(proposal.proposer == msg.sender || isAdmin, "Not authorized to cancel");
         require(!proposal.executed, "Proposal executed");
         require(!proposal.cancelled, "Proposal cancelled");
 
         proposal.cancelled = true;
-        emit ProposalCancelled(_proposalId, msg.sender);
+        emit ProposalCancelled(_proposalId, msg.sender, isAdmin);
     }
 
     /**
      * @dev Delegate voting power to another address
      * @param _delegate Address to delegate to
      */
-    function delegate(address _delegate) external {
+    function delegate(address _delegate) external whenNotPaused {
         require(_delegate != address(0), "Invalid delegate");
         require(_delegate != msg.sender, "Cannot delegate to self");
 
@@ -262,14 +307,18 @@ contract Governance is ReentrancyGuard, Ownable {
         address fromDelegate = currentDelegate.delegate;
         
         if (fromDelegate != address(0)) {
+            uint256 oldPower = votingPower[fromDelegate];
             votingPower[fromDelegate] -= currentDelegate.delegatedVotes;
+            emit VotingPowerUpdated(fromDelegate, oldPower, votingPower[fromDelegate]);
         }
 
         currentDelegate.delegate = _delegate;
         currentDelegate.delegatedVotes = governanceToken.balanceOf(msg.sender);
         currentDelegate.lastDelegationTime = block.timestamp;
 
+        uint256 oldDelegatePower = votingPower[_delegate];
         votingPower[_delegate] += currentDelegate.delegatedVotes;
+        emit VotingPowerUpdated(_delegate, oldDelegatePower, votingPower[_delegate]);
 
         emit DelegateChanged(msg.sender, fromDelegate, _delegate);
     }
@@ -283,13 +332,21 @@ contract Governance is ReentrancyGuard, Ownable {
         require(msg.sender == address(governanceToken), "Only token contract can update");
         
         Delegate storage userDelegate = delegates[_user];
+        uint256 oldPower;
+        
         if (userDelegate.delegate != address(0)) {
+            oldPower = votingPower[userDelegate.delegate];
             votingPower[userDelegate.delegate] = votingPower[userDelegate.delegate] - userDelegate.delegatedVotes + _newBalance;
             userDelegate.delegatedVotes = _newBalance;
+            emit VotingPowerUpdated(userDelegate.delegate, oldPower, votingPower[userDelegate.delegate]);
         } else {
+            oldPower = votingPower[_user];
             votingPower[_user] = _newBalance;
+            emit VotingPowerUpdated(_user, oldPower, _newBalance);
         }
     }
+
+    // ============ View Functions ============
 
     /**
      * @dev Get proposal details
@@ -367,22 +424,6 @@ contract Governance is ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev Whitelist an address
-     * @param _address Address to whitelist
-     */
-    function whitelistAddress(address _address) external onlyOwner {
-        isWhitelisted[_address] = true;
-    }
-
-    /**
-     * @dev Remove address from whitelist
-     * @param _address Address to remove
-     */
-    function removeFromWhitelist(address _address) external onlyOwner {
-        isWhitelisted[_address] = false;
-    }
-
-    /**
      * @dev Get total proposal count
      * @return Total number of proposals
      */
@@ -433,4 +474,59 @@ contract Governance is ReentrancyGuard, Ownable {
         
         return "Queued";
     }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @dev Whitelist an address
+     * @param _address Address to whitelist
+     */
+    function whitelistAddress(address _address) external onlyOwner {
+        require(_address != address(0), "Invalid address");
+        isWhitelisted[_address] = true;
+        emit WhitelistUpdated(_address, true);
+    }
+
+    /**
+     * @dev Remove address from whitelist
+     * @param _address Address to remove
+     */
+    function removeFromWhitelist(address _address) external onlyOwner {
+        isWhitelisted[_address] = false;
+        emit WhitelistUpdated(_address, false);
+    }
+
+    /**
+     * @dev Pause the contract
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    /**
+     * @dev Unpause the contract
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /**
+     * @dev Withdraw stuck ETH from contract
+     * @param _recipient Address to receive ETH
+     */
+    function withdrawETH(address payable _recipient) external onlyOwner {
+        require(_recipient != address(0), "Invalid recipient");
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No ETH to withdraw");
+        
+        (bool success, ) = _recipient.call{value: balance}("");
+        require(success, "ETH transfer failed");
+        
+        emit ETHWithdrawn(_recipient, balance);
+    }
+
+    /**
+     * @dev Receive ETH (for proposal execution)
+     */
+    receive() external payable {}
 }
